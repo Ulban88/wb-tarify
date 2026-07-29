@@ -1,0 +1,29 @@
+name: Тарифы WB
+
+on:
+  schedule:
+    # каждый понедельник в 06:00 UTC — это 09:00 по Москве
+    - cron: "0 6 * * 1"
+  workflow_dispatch:        # и по кнопке, когда нужно прямо сейчас
+
+jobs:
+  obnovit-tarify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Забрать тарифы у WB
+        env:
+          WB_TOKEN: ${{ secrets.WB_TOKEN }}
+        run: python3 fetch_tariffs.py
+
+      - name: Сохранить, если что-то поменялось
+        run: |
+          git config user.name "робот тарифов"
+          git config user.email "actions@github.com"
+          git add tarify.tsv
+          git diff --staged --quiet && echo "тарифы не менялись" && exit 0
+          git commit -m "тарифы на $(date +%F)"
+          git push
