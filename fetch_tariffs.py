@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Тянет комиссии WB по курткам и кладёт их в tarify.csv.
+"""Тянет тарифы WB и кладёт их в tarify.tsv.
 
-Первый тонкий кусок: только комиссия, только FBO и FBS.
-Логистика, хранение и склады — следующим шагом.
+Два запроса:
+1. Комиссии по предметам — для «Куртки» FBO и FBS.
+2. Тарифы коробов — хранение и логистика по каждому складу WB.
+
+Колонки разделяем табуляцией, а не запятой: тогда запятая свободна для самих
+чисел, и русская Google Таблица читает «37,5» как число, а не как текст.
 
 Токен берётся из переменной окружения WB_TOKEN. В коде и в файлах его нет.
-Если WB не ответил — старый tarify.csv не трогаем, выходим с ошибкой.
+Если WB не ответил — старый tarify.tsv не трогаем, выходим с ошибкой.
 """
 
 import csv
@@ -17,8 +21,19 @@ import urllib.request
 from datetime import date
 
 API_COMMISSION = "https://common-api.wildberries.ru/api/v1/tariffs/commission?locale=ru"
+API_BOX = "https://common-api.wildberries.ru/api/v1/tariffs/box?date={day}"
 TIMEOUT_SEC = 30
-OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tarify.csv")
+OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tarify.tsv")
+
+HEADER = [
+    "Что",
+    "Предмет или склад",
+    "Комиссия % · Хранение 1-й литр ₽/сутки",
+    "Хранение доп. литр ₽/сутки",
+    "Логистика 1-й литр ₽",
+    "Логистика доп. литр ₽",
+    "Обновлено",
+]
 
 # какие предметы забираем; имена — как их называет сам WB
 SUBJECTS = ("Куртки",)
@@ -28,6 +43,14 @@ SCHEMES = {
     "paidStorageKgvp": "FBO",   # товар лежит на складе WB
     "kgvpMarketplace": "FBS",   # товар лежит у продавца
 }
+
+# поля тарифа короба в том порядке, в котором пишем их в файл
+BOX_FIELDS = (
+    "boxStorageBase",     # хранение, первый литр, ₽ в сутки
+    "boxStorageLiter",    # хранение, каждый следующий литр
+    "boxDeliveryBase",    # логистика до клиента, первый литр
+    "boxDeliveryLiter",   # логистика, каждый следующий литр
+)
 
 
 def explain_http_error(code: int) -> str:
@@ -39,29 +62,38 @@ def explain_http_error(code: int) -> str:
     return messages.get(code, f"WB вернул ошибку {code}. Тарифы не обновлены.")
 
 
-def fetch_commissions(token: str) -> list:
-    """Забирает у WB справочник комиссий. Кидает понятную ошибку, если не пустило."""
+def call_wb(url: str, token: str) -> dict:
+    """Один запрос в WB. Кидает понятную ошибку, если не пустило."""
     request = urllib.request.Request(
-        API_COMMISSION,
+        url,
         headers={"Authorization": token, "Accept": "application/json"},
     )
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SEC) as response:
-            payload = json.load(response)
+            return json.load(response)
     except urllib.error.HTTPError as error:
         raise SystemExit(explain_http_error(error.code)) from error
     except urllib.error.URLError as error:
         raise SystemExit(f"WB не отвечает: {error.reason}. Тарифы не обновлены.") from error
 
+
+def as_russian_number(value) -> str:
+    """37.5 → «37,5». Google Таблица с русской локалью читает это как число.
+
+    Пустоту и прочерк («-» у складов без коробов) превращаем в пустую ячейку.
+    """
+    text = str(value).strip() if value is not None else ""
+    if text in ("", "-"):
+        return ""
+    return text.replace(".", ",")
+
+
+def commission_rows(token: str, today: str) -> list:
+    payload = call_wb(API_COMMISSION, token)
     report = payload.get("report")
     if not report:
         raise SystemExit("WB ответил, но справочник комиссий пустой. Тарифы не обновлены.")
-    return report
 
-
-def pick_rows(report: list) -> list:
-    """Оставляет нужные предметы и разворачивает их по схемам работы."""
-    today = date.today().isoformat()
     rows = []
     for item in report:
         if item.get("subjectName") not in SUBJECTS:
@@ -70,14 +102,40 @@ def pick_rows(report: list) -> list:
             value = item.get(field)
             if value is None:
                 continue
-            rows.append([scheme, item["subjectName"], value, today])
+            rows.append([scheme, item["subjectName"],
+                         as_russian_number(value), "", "", "", today])
+    if not rows:
+        raise SystemExit(f"В справочнике WB не нашлись предметы: {', '.join(SUBJECTS)}")
     return sorted(rows)
 
 
-def write_csv(rows: list) -> None:
+def warehouse_rows(token: str, today: str) -> list:
+    payload = call_wb(API_BOX.format(day=today), token)
+    warehouses = payload.get("response", {}).get("data", {}).get("warehouseList") or []
+    if not warehouses:
+        raise SystemExit("WB ответил, но список складов пустой. Тарифы не обновлены.")
+
+    # подсказка на будущее: какие поля вообще отдаёт WB по складу
+    print("поля склада в ответе WB:", ", ".join(sorted(warehouses[0].keys())))
+
+    rows = []
+    for warehouse in warehouses:
+        name = (warehouse.get("warehouseName") or "").strip()
+        if not name:
+            continue
+        values = [as_russian_number(warehouse.get(field)) for field in BOX_FIELDS]
+        if not any(values):
+            continue  # склад без тарифов коробов
+        rows.append(["Склад", name, *values, today])
+    if not rows:
+        raise SystemExit("Ни у одного склада нет тарифов коробов. Тарифы не обновлены.")
+    return sorted(rows, key=lambda row: row[1])
+
+
+def write_table(rows: list) -> None:
     with open(OUT_PATH, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["Схема", "Предмет", "Комиссия %", "Обновлено"])
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(HEADER)
         writer.writerows(rows)
 
 
@@ -86,13 +144,18 @@ def main() -> None:
     if not token:
         raise SystemExit("Нет токена: переменная WB_TOKEN пустая.")
 
-    rows = pick_rows(fetch_commissions(token))
-    if not rows:
-        raise SystemExit(f"В справочнике WB не нашлись предметы: {', '.join(SUBJECTS)}")
+    today = date.today().isoformat()
+    commissions = commission_rows(token, today)
+    warehouses = warehouse_rows(token, today)
 
-    write_csv(rows)
-    for scheme, subject, commission, updated in rows:
-        print(f"{subject} {scheme}: {commission}% (на {updated})")
+    write_table(commissions + warehouses)
+
+    for scheme, subject, value, *_ in commissions:
+        print(f"{subject} {scheme}: {value}% (на {today})")
+    print(f"складов с тарифами коробов: {len(warehouses)}")
+    example = warehouses[0]
+    print(f"пример: {example[1]} — хранение {example[2]} + {example[3]}/литр, "
+          f"логистика {example[4]} + {example[5]}/литр")
     print(f"записано: {OUT_PATH}")
 
 
