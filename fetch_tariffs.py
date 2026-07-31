@@ -36,7 +36,7 @@ HEADER = [
 ]
 
 # какие предметы забираем; имена — как их называет сам WB
-SUBJECTS = ("Куртки",)
+SUBJECTS = ("Куртки", "Свитеры", "Джемперы", "Кардиганы")
 
 # поле ответа WB → название схемы работы человеческим языком
 SCHEMES = {
@@ -96,14 +96,21 @@ def commission_rows(token: str, today: str) -> list:
 
     rows = []
     for item in report:
-        if item.get("subjectName") not in SUBJECTS:
+        subject = item.get("subjectName")
+        if subject not in SUBJECTS:
             continue
         for field, scheme in SCHEMES.items():
             value = item.get(field)
             if value is None:
                 continue
-            rows.append([scheme, item["subjectName"],
+            # ключ «FBO Свитеры» — по нему таблица категории ищет свою комиссию
+            rows.append([f"{scheme} {subject}", subject,
                          as_russian_number(value), "", "", "", today])
+            # старые ключи «FBO»/«FBS» без предмета оставляем для живой
+            # таблицы курток — она ищет комиссию именно по ним
+            if subject == "Куртки":
+                rows.append([scheme, subject,
+                             as_russian_number(value), "", "", "", today])
     if not rows:
         raise SystemExit(f"В справочнике WB не нашлись предметы: {', '.join(SUBJECTS)}")
     return sorted(rows)
