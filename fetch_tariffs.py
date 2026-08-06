@@ -6,6 +6,7 @@
 2. Тарифы коробов — хранение и логистика по каждому складу WB.
 3. Отчёт о реализации за прошлый месяц — из него считаем СПП по предметам
    (скидку покупателю WB даёт поверх нашей цены за свой счёт).
+4. MPSTATS (если задан MPSTATS_TOKEN) — выкуп по нишам за тот же месяц.
 
 Колонки разделяем табуляцией, а не запятой: тогда запятая свободна для самих
 чисел, и русская Google Таблица читает «37,5» как число, а не как текст.
@@ -20,6 +21,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, timedelta
 
@@ -217,6 +219,67 @@ def spp_rows(token: str, today: str) -> list:
     return sorted(result, key=lambda row: row[1])
 
 
+# ---- выкуп по нишам: внешняя аналитика MPSTATS -------------------------------
+# Свой процент выкупа у продавца всегда важнее, но полезно видеть, сколько
+# выкупают в нише целиком. MPSTATS отдаёт это в карточке товара полем purchase.
+API_MPSTATS = "https://mpstats.io/api/wb/get/category?path={path}&d1={start}&d2={end}"
+MPSTATS_TIMEOUT_SEC = 90
+MPSTATS_GAP_SEC = 1          # не долбим чужой сервис
+NICHE_PATHS = {
+    "Блузки-Рубашки": "Женщинам/Блузки и рубашки",
+    "Брюки": "Женщинам/Брюки",
+    "Кардиганы": "Женщинам/Офис/Кардиганы",
+    "Костюмы": "Женщинам/Костюмы",
+    "Куртки": "Женщинам/Верхняя одежда/Куртка",
+    "Лонгсливы": "Женщинам/Лонгсливы",
+    "Ночные сорочки": "Женщинам/Одежда для дома/Пижамы и сорочки",
+    "Пижамы": "Женщинам/Одежда для дома/Пижамы и сорочки",
+    "Платья": "Женщинам/Офис/Платья",
+    "Свитеры": "Женщинам/Большие размеры/Пуловеры, кофты, свитеры",
+    "Свитшоты": "Женщинам/Толстовки, свитшоты и худи",
+    "Толстовки": "Женщинам/Толстовки, свитшоты и худи",
+    "Топы": "Женщинам/Футболки и топы",
+    "Худи": "Женщинам/Для невысоких/Худи"
+}
+
+
+def mpstats_purchase(path: str, token: str, start: str, end: str):
+    """Средний выкуп по нише: (выкуп, выкуп после возвратов) или (None, None)."""
+    url = API_MPSTATS.format(path=urllib.parse.quote(path), start=start, end=end)
+    request = urllib.request.Request(url, headers={"X-Mpstats-TOKEN": token})
+    try:
+        with urllib.request.urlopen(request, timeout=MPSTATS_TIMEOUT_SEC) as response:
+            rows = (json.load(response) or {}).get("data") or []
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as error:
+        print(f"  ниша «{path}» не ответила: {error}")
+        return None, None
+    got = [r.get("purchase") for r in rows if r.get("purchase")]
+    after = [r.get("purchase_after_return") for r in rows if r.get("purchase_after_return")]
+    if not got:
+        return None, None
+    return (round(sum(got) / len(got), 1),
+            round(sum(after) / len(after), 1) if after else None)
+
+
+def buyout_rows(today: str) -> list:
+    """Строки «Выкуп» по нишам за прошлый месяц. Без токена — пустой список."""
+    token = os.environ.get("MPSTATS_TOKEN", "").strip()
+    if not token:
+        print("MPSTATS_TOKEN не задан — выкуп по нишам пропускаем")
+        return []
+    start, end = previous_month(date.fromisoformat(today))
+    rows = []
+    for category, path in sorted(NICHE_PATHS.items()):
+        purchase, after = mpstats_purchase(path, token, start, end)
+        if purchase is None:
+            continue
+        # колонка 3 — выкуп, колонка 4 — он же после возвратов (обе были пустые у комиссий)
+        rows.append(["Выкуп", category, as_russian_number(purchase),
+                     as_russian_number(after), "", "", today, "", ""])
+        time.sleep(MPSTATS_GAP_SEC)
+    return rows
+
+
 def write_table(rows: list) -> None:
     with open(OUT_PATH, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -241,12 +304,22 @@ def main() -> None:
         print(f"СПП не собрана ({error}) — пишем файл без неё")
         spp = []
 
-    write_table(commissions + warehouses + spp)
+    # выкуп по нишам — тоже необязательный: нет ключа MPSTATS или сервис молчит,
+    # значит в файле просто не будет этих строк, а тарифы обновятся как обычно
+    try:
+        buyout = buyout_rows(today)
+    except Exception as error:                 # noqa: BLE001 — чужой сервис, любая беда
+        print(f"выкуп по нишам не собран ({error}) — пишем файл без него")
+        buyout = []
+
+    write_table(commissions + warehouses + spp + buyout)
 
     for scheme, subject, value, *_ in commissions:
         print(f"{subject} {scheme}: {value}% (на {today})")
     for _, subject, percent, *_ in spp:
         print(f"СПП {subject}: {percent}%")
+    for _, category, percent, after, *_ in buyout:
+        print(f"выкуп в нише {category}: {percent}% (после возвратов {after}%)")
     print(f"складов с тарифами коробов: {len(warehouses)}")
     example = warehouses[0]
     print(f"пример: {example[1]} — хранение {example[2]} + {example[3]}/литр, "

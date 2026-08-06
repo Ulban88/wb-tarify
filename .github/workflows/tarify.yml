@@ -17,6 +17,8 @@ jobs:
       - name: Забрать тарифы у WB
         env:
           WB_TOKEN: ${{ secrets.WB_TOKEN }}
+          # без этого ключа робот просто не соберёт выкуп по нишам, тарифы обновит как обычно
+          MPSTATS_TOKEN: ${{ secrets.MPSTATS_TOKEN }}
         run: python3 fetch_tariffs.py
 
       - name: Сохранить, если что-то поменялось
