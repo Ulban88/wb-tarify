@@ -200,6 +200,12 @@ def spp_rows(token: str, today: str) -> list:
         time.sleep(REPORT_PAUSE_SEC)
 
     result = []
+    total_seller, total_client = sum(seller.values()), sum(client.values())
+    if total_seller >= SPP_MIN_REVENUE:
+        # средняя по кабинету: ею портал переводит выручку из цен покупателя
+        # в наши цены, когда считает долю рекламы
+        result.append(["СПП", "ВСЕГО", as_russian_number(
+            round(100 * (1 - total_client / total_seller), 1)), "", "", "", today, "", ""])
     for subject, revenue in seller.items():
         if revenue < SPP_MIN_REVENUE:
             continue
