@@ -33,6 +33,10 @@ HEADER = [
     "Логистика 1-й литр ₽",
     "Логистика доп. литр ₽",
     "Обновлено",
+    # ↓ новые колонки дописаны В КОНЕЦ нарочно: старые остались на своих местах,
+    # поэтому формулы Google-книг и разбор портала не поехали
+    "Логистика FBS 1-й литр ₽",
+    "Логистика FBS доп. литр ₽",
 ]
 
 # какие предметы забираем; имена — как их называет сам WB
@@ -53,6 +57,13 @@ BOX_FIELDS = (
     "boxStorageLiter",    # хранение, каждый следующий литр
     "boxDeliveryBase",    # логистика до клиента, первый литр
     "boxDeliveryLiter",   # логистика, каждый следующий литр
+)
+
+# то же самое, но когда товар лежит у продавца (FBS). WB зовёт это «маркетплейс»
+# и считает по складу, куда сдаём заказы; у части складов ставка отличается от FBO
+FBS_FIELDS = (
+    "boxDeliveryMarketplaceBase",    # логистика FBS, первый литр, ₽
+    "boxDeliveryMarketplaceLiter",   # логистика FBS, каждый следующий литр
 )
 
 
@@ -108,12 +119,12 @@ def commission_rows(token: str, today: str) -> list:
                 continue
             # ключ «FBO Свитеры» — по нему таблица категории ищет свою комиссию
             rows.append([f"{scheme} {subject}", subject,
-                         as_russian_number(value), "", "", "", today])
+                         as_russian_number(value), "", "", "", today, "", ""])
             # старые ключи «FBO»/«FBS» без предмета оставляем для живой
             # таблицы курток — она ищет комиссию именно по ним
             if subject == "Куртки":
                 rows.append([scheme, subject,
-                             as_russian_number(value), "", "", "", today])
+                             as_russian_number(value), "", "", "", today, "", ""])
     if not rows:
         raise SystemExit(f"В справочнике WB не нашлись предметы: {', '.join(SUBJECTS)}")
     return sorted(rows)
@@ -136,7 +147,8 @@ def warehouse_rows(token: str, today: str) -> list:
         values = [as_russian_number(warehouse.get(field)) for field in BOX_FIELDS]
         if not any(values):
             continue  # склад без тарифов коробов
-        rows.append(["Склад", name, *values, today])
+        fbs = [as_russian_number(warehouse.get(field)) for field in FBS_FIELDS]
+        rows.append(["Склад", name, *values, today, *fbs])
     if not rows:
         raise SystemExit("Ни у одного склада нет тарифов коробов. Тарифы не обновлены.")
     return sorted(rows, key=lambda row: row[1])
