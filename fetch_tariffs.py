@@ -7,6 +7,8 @@
 3. Отчёт о реализации за прошлый месяц — из него считаем СПП по предметам
    (скидку покупателю WB даёт поверх нашей цены за свой счёт).
 4. MPSTATS (если задан MPSTATS_TOKEN) — выкуп по нишам за тот же месяц.
+5. Тот же отчёт с 1 января — накопленный доход кабинета: по нему считаются
+   налоговые пороги и НДС (база — то, что заплатил покупатель).
 
 Колонки разделяем табуляцией, а не запятой: тогда запятая свободна для самих
 чисел, и русская Google Таблица читает «37,5» как число, а не как текст.
@@ -33,6 +35,8 @@ TIMEOUT_SEC = 30
 REPORT_TIMEOUT_SEC = 180     # отчёт о реализации большой, отдаётся медленно
 REPORT_PAUSE_SEC = 65        # WB пускает в этот отчёт раз в минуту
 REPORT_MAX_PAGES = 3
+YEAR_MAX_PAGES = 12       # годовой проход длиннее месячного
+CABINET = os.environ.get("WB_CABINET_NAME", "NESS").strip() or "NESS"
 SPP_MIN_REVENUE = 100_000    # предметы мельче не пишем: статистики мало, цифра случайная
 OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tarify.tsv")
 
@@ -280,6 +284,41 @@ def buyout_rows(today: str) -> list:
     return rows
 
 
+def income_rows(token: str, today: str) -> list:
+    """Доход кабинета с 1 января: база налоговых порогов и НДС.
+
+    Считаем по retail_amount — это то, что заплатил покупатель. Скидку постоянного
+    покупателя WB даёт за свой счёт, в базу она не входит: так же считает налог
+    книга финансиста, сверено 07.08.2026.
+    """
+    day = date.fromisoformat(today)
+    start, end = date(day.year, 1, 1).isoformat(), today
+    sold = back = 0.0
+    rrd, pages = 0, 0
+    while pages < YEAR_MAX_PAGES:
+        rows = call_wb(API_REPORT.format(start=start, end=end, rrd=rrd),
+                       token, REPORT_TIMEOUT_SEC) or []
+        if not rows:
+            break
+        for row in rows:
+            kind = (row.get("doc_type_name") or "").strip()
+            amount = row.get("retail_amount") or 0
+            if kind == "Продажа":
+                sold += amount
+            elif kind == "Возврат":
+                back += amount
+        rrd = rows[-1].get("rrd_id") or 0
+        pages += 1
+        if len(rows) < 100000:
+            break
+        time.sleep(REPORT_PAUSE_SEC)
+    if sold <= 0:
+        return []
+    # колонка 3 — доход с начала года, колонка 4 — возвраты (для проверки)
+    return [["Доход", CABINET, as_russian_number(round(sold - back)),
+             as_russian_number(round(back)), "", "", today, "", ""]]
+
+
 def write_table(rows: list) -> None:
     with open(OUT_PATH, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -312,12 +351,20 @@ def main() -> None:
         print(f"выкуп по нишам не собран ({error}) — пишем файл без него")
         buyout = []
 
-    write_table(commissions + warehouses + spp + buyout)
+    try:
+        income = income_rows(token, today)
+    except SystemExit as error:
+        print(f"доход с начала года не собран ({error})")
+        income = []
+
+    write_table(commissions + warehouses + spp + buyout + income)
 
     for scheme, subject, value, *_ in commissions:
         print(f"{subject} {scheme}: {value}% (на {today})")
     for _, subject, percent, *_ in spp:
         print(f"СПП {subject}: {percent}%")
+    for _, cab, money, back, *_ in income:
+        print(f"доход кабинета {cab} с начала года: {money} руб (возвратов {back})")
     for _, category, percent, after, *_ in buyout:
         print(f"выкуп в нише {category}: {percent}% (после возвратов {after}%)")
     print(f"складов с тарифами коробов: {len(warehouses)}")
