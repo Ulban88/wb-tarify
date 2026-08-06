@@ -185,6 +185,7 @@ def spp_rows(token: str, today: str) -> list:
     """
     start, end = previous_month(date.fromisoformat(today))
     seller, client = {}, {}
+    fwd_sum = fwd_cnt = back_sum = back_cnt = 0.0
     rrd, pages = 0, 0
     while pages < REPORT_MAX_PAGES:
         rows = call_wb(API_REPORT.format(start=start, end=end, rrd=rrd),
@@ -192,6 +193,15 @@ def spp_rows(token: str, today: str) -> list:
         if not rows:
             break
         for row in rows:
+            # логистика: WB отдельно пишет поездку до клиента и обратную дорогу
+            if (row.get("supplier_oper_name") or "").strip() == "Логистика":
+                money = row.get("delivery_rub") or 0
+                if (row.get("delivery_amount") or 0) > 0:
+                    fwd_sum += money
+                    fwd_cnt += row["delivery_amount"]
+                elif (row.get("return_amount") or 0) > 0:
+                    back_sum += money
+                    back_cnt += row["return_amount"]
             if (row.get("doc_type_name") or "").strip() != "Продажа":
                 continue
             subject = (row.get("subject_name") or "").strip()
@@ -206,6 +216,15 @@ def spp_rows(token: str, today: str) -> list:
         time.sleep(REPORT_PAUSE_SEC)
 
     result = []
+    # средняя цена поездки: до клиента и обратно. Обратную портал раньше держал
+    # ручной цифрой (100 ₽), хотя WB отдаёт её фактом
+    if back_cnt:
+        result.append(["Обратка", CABINET, as_russian_number(round(back_sum / back_cnt, 1)),
+                       as_russian_number(int(back_cnt)), "", "", today, "", ""])
+    if fwd_cnt:
+        result.append(["Доставка факт", CABINET,
+                       as_russian_number(round(fwd_sum / fwd_cnt, 1)),
+                       as_russian_number(int(fwd_cnt)), "", "", today, "", ""])
     total_seller, total_client = sum(seller.values()), sum(client.values())
     if total_seller >= SPP_MIN_REVENUE:
         # средняя по кабинету: ею портал переводит выручку из цен покупателя
@@ -363,6 +382,9 @@ def main() -> None:
         print(f"{subject} {scheme}: {value}% (на {today})")
     for _, subject, percent, *_ in spp:
         print(f"СПП {subject}: {percent}%")
+    for kind, cab, value, cnt, *_ in spp:
+        if kind in ("Обратка", "Доставка факт"):
+            print(f"{kind} по кабинету {cab}: {value} руб (поездок {cnt})")
     for _, cab, money, back, *_ in income:
         print(f"доход кабинета {cab} с начала года: {money} руб (возвратов {back})")
     for _, category, percent, after, *_ in buyout:
