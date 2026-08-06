@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Тянет тарифы WB и кладёт их в tarify.tsv.
 
-Два запроса:
+Три запроса:
 1. Комиссии по предметам — для «Куртки» FBO и FBS.
 2. Тарифы коробов — хранение и логистика по каждому складу WB.
+3. Отчёт о реализации за прошлый месяц — из него считаем СПП по предметам
+   (скидку покупателю WB даёт поверх нашей цены за свой счёт).
 
 Колонки разделяем табуляцией, а не запятой: тогда запятая свободна для самих
 чисел, и русская Google Таблица читает «37,5» как число, а не как текст.
@@ -16,13 +18,20 @@ import csv
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
-from datetime import date
+from datetime import date, timedelta
 
 API_COMMISSION = "https://common-api.wildberries.ru/api/v1/tariffs/commission?locale=ru"
 API_BOX = "https://common-api.wildberries.ru/api/v1/tariffs/box?date={day}"
+API_REPORT = ("https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod"
+              "?dateFrom={start}&dateTo={end}&limit=100000&rrdid={rrd}")
 TIMEOUT_SEC = 30
+REPORT_TIMEOUT_SEC = 180     # отчёт о реализации большой, отдаётся медленно
+REPORT_PAUSE_SEC = 65        # WB пускает в этот отчёт раз в минуту
+REPORT_MAX_PAGES = 3
+SPP_MIN_REVENUE = 100_000    # предметы мельче не пишем: статистики мало, цифра случайная
 OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tarify.tsv")
 
 HEADER = [
@@ -76,14 +85,14 @@ def explain_http_error(code: int) -> str:
     return messages.get(code, f"WB вернул ошибку {code}. Тарифы не обновлены.")
 
 
-def call_wb(url: str, token: str) -> dict:
+def call_wb(url: str, token: str, timeout: int = TIMEOUT_SEC) -> dict:
     """Один запрос в WB. Кидает понятную ошибку, если не пустило."""
     request = urllib.request.Request(
         url,
         headers={"Authorization": token, "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SEC) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
         raise SystemExit(explain_http_error(error.code)) from error
@@ -154,6 +163,54 @@ def warehouse_rows(token: str, today: str) -> list:
     return sorted(rows, key=lambda row: row[1])
 
 
+def previous_month(today: date) -> tuple:
+    """Границы прошлого полного месяца: («2026-07-01», «2026-08-01»)."""
+    first_this_month = today.replace(day=1)
+    last_prev_month = first_this_month - timedelta(days=1)
+    return last_prev_month.replace(day=1).isoformat(), first_this_month.isoformat()
+
+
+def spp_rows(token: str, today: str) -> list:
+    """СПП по предметам из отчёта о реализации за прошлый месяц.
+
+    Цена продавца (retail_price_withdisc_rub) — сколько причитается нам,
+    retail_amount — сколько на самом деле заплатил покупатель. Разница и есть
+    скидка постоянного покупателя: её WB даёт за свой счёт.
+    """
+    start, end = previous_month(date.fromisoformat(today))
+    seller, client = {}, {}
+    rrd, pages = 0, 0
+    while pages < REPORT_MAX_PAGES:
+        rows = call_wb(API_REPORT.format(start=start, end=end, rrd=rrd),
+                       token, REPORT_TIMEOUT_SEC) or []
+        if not rows:
+            break
+        for row in rows:
+            if (row.get("doc_type_name") or "").strip() != "Продажа":
+                continue
+            subject = (row.get("subject_name") or "").strip()
+            if not subject:
+                continue
+            seller[subject] = seller.get(subject, 0) + (row.get("retail_price_withdisc_rub") or 0)
+            client[subject] = client.get(subject, 0) + (row.get("retail_amount") or 0)
+        rrd = rows[-1].get("rrd_id") or 0
+        pages += 1
+        if len(rows) < 100000:
+            break
+        time.sleep(REPORT_PAUSE_SEC)
+
+    result = []
+    for subject, revenue in seller.items():
+        if revenue < SPP_MIN_REVENUE:
+            continue
+        percent = round(100 * (1 - client.get(subject, 0) / revenue), 1)
+        if not 0 <= percent <= 95:
+            continue  # мусорная строка: скидки такого размера у WB не бывает
+        result.append(["СПП", subject, as_russian_number(percent),
+                       "", "", "", today, "", ""])
+    return sorted(result, key=lambda row: row[1])
+
+
 def write_table(rows: list) -> None:
     with open(OUT_PATH, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -170,10 +227,20 @@ def main() -> None:
     commissions = commission_rows(token, today)
     warehouses = warehouse_rows(token, today)
 
-    write_table(commissions + warehouses)
+    # СПП — приятное дополнение, а не главное: если токену не хватит прав
+    # на статистику или WB промолчит, тарифы всё равно обновим
+    try:
+        spp = spp_rows(token, today)
+    except SystemExit as error:
+        print(f"СПП не собрана ({error}) — пишем файл без неё")
+        spp = []
+
+    write_table(commissions + warehouses + spp)
 
     for scheme, subject, value, *_ in commissions:
         print(f"{subject} {scheme}: {value}% (на {today})")
+    for _, subject, percent, *_ in spp:
+        print(f"СПП {subject}: {percent}%")
     print(f"складов с тарифами коробов: {len(warehouses)}")
     example = warehouses[0]
     print(f"пример: {example[1]} — хранение {example[2]} + {example[3]}/литр, "
