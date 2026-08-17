@@ -52,6 +52,9 @@ HEADER = [
     # поэтому формулы Google-книг и разбор портала не поехали
     "Логистика FBS 1-й литр ₽",
     "Логистика FBS доп. литр ₽",
+    # 17.08.2026: «Россия» или «СНГ» — иначе не отделить свои склады от чужих,
+    # а средняя ставка считалась по Ташкенту и Ереваном
+    "Страна склада",
 ]
 
 # какие предметы забираем; имена — как их называет сам WB
@@ -160,10 +163,18 @@ def warehouse_rows(token: str, today: str) -> list:
         if not name:
             continue
         values = [as_russian_number(warehouse.get(field)) for field in BOX_FIELDS]
-        if not any(values):
-            continue  # склад без тарифов коробов
         fbs = [as_russian_number(warehouse.get(field)) for field in FBS_FIELDS]
-        rows.append(["Склад", name, *values, today, *fbs])
+        # ⚠️ 17.08.2026: НЕ отбрасывать склад, у которого пусты только FBO-поля.
+        # С 15.08.2026 WB не даёт ставок по складам РФ: селлер больше не выбирает
+        # склад на FBO, тарифы FBW и FBS уравнены, и российская ставка приходит
+        # ОДНОЙ строкой «Свой склад РФ» — там boxDelivery* пустые, а ставка лежит
+        # в boxDeliveryMarketplace* (78,2 ₽ = 46 × коэффициент 170%). Старый
+        # фильтр «нет тарифов коробов» выбрасывал именно её, и в файле остались
+        # только склады СНГ — портал считал логистику по Ташкенту и Ереваном.
+        if not any(values) and not any(fbs):
+            continue  # склад вообще без тарифов
+        geo = (warehouse.get("geoName") or "").strip()
+        rows.append(["Склад", name, *values, today, *fbs, geo])
     if not rows:
         raise SystemExit("Ни у одного склада нет тарифов коробов. Тарифы не обновлены.")
     return sorted(rows, key=lambda row: row[1])
